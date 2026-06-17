@@ -7,11 +7,19 @@
 
 #include <algorithm>
 #include <cassert>
-#include <cmath>
-#include <cstring>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <limits>
 #include <map>
+#include <sstream>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
@@ -374,6 +382,368 @@ llama_kv_cache::llama_kv_cache(
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
+
+    // PCA KV cache rotation (POC): optional, enabled by LLAMA_KV_PCA_FILE
+    const char * LLAMA_KV_PCA_FILE = getenv("LLAMA_KV_PCA_FILE");
+    fprintf(stderr, "%s: === kv cache constructed (PCA env check) LLAMA_KV_PCA_FILE=%s ===\n",
+            __func__, LLAMA_KV_PCA_FILE ? LLAMA_KV_PCA_FILE : "(null)");
+    fflush(stderr);
+    if (LLAMA_KV_PCA_FILE && LLAMA_KV_PCA_FILE[0]) {
+        load_pca(LLAMA_KV_PCA_FILE);
+    }
+
+    // Mean-only mode (POC): load PCA file but only use per-head means. Hadamard rotation
+    // stays enabled. Build_attn subtracts mean before Hadamard forward and adds V mean
+    // back after back-rotation. Ablation shows this captures ~all of PCA's Q4_0 win.
+    const char * LLAMA_KV_MEAN_ONLY = getenv("LLAMA_KV_MEAN_ONLY");
+    if (pca_enabled && LLAMA_KV_MEAN_ONLY && atoi(LLAMA_KV_MEAN_ONLY)) {
+        pca_mean_only = true;
+        fprintf(stderr, "%s: PCA mean-only mode (LLAMA_KV_MEAN_ONLY=1) — Hadamard stays enabled, "
+                        "using loaded means for per-head offset only\n", __func__);
+        fflush(stderr);
+    }
+
+    // PCA replaces the Hadamard quantization rotation. Suppress the Hadamard path (attn_rot_k/v)
+    // when PCA is active — otherwise the Hadamard rotation input (self_k_rot) gets created but
+    // never consumed by the graph (PCA's build_attn skips mul_mat_aux), leaving it as a dead
+    // leaf that the scheduler fails to allocate, crashing set_input_k_rot on the next decode.
+    //
+    // Exception: mean-only mode keeps Hadamard enabled (we WANT both — mean offset + Hadamard rotation).
+    if (pca_enabled && !pca_mean_only) {
+        if (attn_rot_k || attn_rot_v) {
+            fprintf(stderr, "%s: PCA enabled — suppressing Hadamard attention rotation (attn_rot_k=%d attn_rot_v=%d -> 0)\n",
+                    __func__, attn_rot_k, attn_rot_v);
+            fflush(stderr);
+        }
+        attn_rot_k = false;
+        attn_rot_v = false;
+    }
+}
+
+// Load a .bin produced by pca_dump.py:
+//     magic[8]="PCAKV001" version n_layers n_kv_head head_dim
+//     for each layer: layer_idx W_k[W_k]*D*D] W_v[...] mean_k[...] mean_v[...]
+//
+// Allocates per-layer ggml tensors (F32) in a dedicated CPU context owned by the kv cache.
+// We also compute W_v_t (transpose of W_v) here so the runtime graph can stay branch-free.
+void llama_kv_cache::load_pca(const std::string & path) {
+    fprintf(stderr, "%s: === PCA KV cache rotation POC ===\n", __func__);
+    fprintf(stderr, "%s: LLAMA_KV_PCA_FILE = %s\n", __func__, path.c_str());
+    fflush(stderr);
+
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        fprintf(stderr, "%s: could not open PCA file '%s' (LLAMA_KV_PCA_FILE)\n", __func__, path.c_str());
+        fflush(stderr);
+        return;
+    }
+
+    char magic[8];
+    f.read(magic, 8);
+    if (std::memcmp(magic, "PCAKV001", 8) != 0) {
+        LLAMA_LOG_WARN("%s: bad PCA file magic in '%s'\n", __func__, path.c_str());
+        return;
+    }
+
+    uint32_t version = 0, n_layers = 0, n_kv_head = 0, head_dim = 0;
+    f.read(reinterpret_cast<char *>(&version),   sizeof(uint32_t));
+    f.read(reinterpret_cast<char *>(&n_layers),  sizeof(uint32_t));
+    f.read(reinterpret_cast<char *>(&n_kv_head), sizeof(uint32_t));
+    f.read(reinterpret_cast<char *>(&head_dim),  sizeof(uint32_t));
+    if (version != 1) {
+        LLAMA_LOG_WARN("%s: unsupported PCA file version %u\n", __func__, version);
+        return;
+    }
+
+    // sanity against hparams: head_dim must match K (and V) head size
+    if (n_embd_head_k_all > 0 && (uint32_t) n_embd_head_k_all != head_dim) {
+        LLAMA_LOG_WARN("%s: PCA head_dim=%u does not match model n_embd_head_k=%d\n",
+                __func__, head_dim, n_embd_head_k_all);
+        return;
+    }
+
+    // read all raw data first
+    struct layer_raw {
+        uint32_t layer_idx;
+        std::vector<float> W_k, W_v, mean_k, mean_v;
+    };
+    std::vector<layer_raw> raws;
+    raws.reserve(n_layers);
+
+    const size_t W_size   = (size_t) n_kv_head * head_dim * head_dim;
+    const size_t mean_size = (size_t) n_kv_head * head_dim;
+
+    for (uint32_t li = 0; li < n_layers; ++li) {
+        layer_raw r;
+        r.W_k.resize(W_size);
+        r.W_v.resize(W_size);
+        r.mean_k.resize(mean_size);
+        r.mean_v.resize(mean_size);
+
+        f.read(reinterpret_cast<char *>(&r.layer_idx), sizeof(uint32_t));
+        f.read(reinterpret_cast<char *>(r.W_k.data()),   r.W_k.size()   * sizeof(float));
+        f.read(reinterpret_cast<char *>(r.W_v.data()),   r.W_v.size()   * sizeof(float));
+        f.read(reinterpret_cast<char *>(r.mean_k.data()), r.mean_k.size() * sizeof(float));
+        f.read(reinterpret_cast<char *>(r.mean_v.data()), r.mean_v.size() * sizeof(float));
+        raws.push_back(std::move(r));
+    }
+    if (!f) {
+        LLAMA_LOG_WARN("%s: PCA file '%s' ended unexpectedly\n", __func__, path.c_str());
+        return;
+    }
+
+    // create ggml tensors (metadata only) in pca_ctx. Backend buffer is allocated below.
+    const size_t tensor_count = (size_t) n_layers * 5;
+    ggml_init_params params = {
+        /*.mem_size   =*/ size_t(tensor_count * ggml_tensor_overhead() + ggml_tensor_overhead()),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    pca_ctx.reset(ggml_init(params));
+    if (!pca_ctx) {
+        LLAMA_LOG_WARN("%s: failed to allocate PCA ggml context\n", __func__);
+        return;
+    }
+
+    // Phase 1: create all tensor metadata in pca_ctx
+    for (const auto & r : raws) {
+        pca_layer_data d;
+        d.W_k   = ggml_new_tensor_3d(pca_ctx.get(), GGML_TYPE_F32, head_dim, head_dim, n_kv_head);
+        d.W_v   = ggml_new_tensor_3d(pca_ctx.get(), GGML_TYPE_F32, head_dim, head_dim, n_kv_head);
+        d.W_v_t = ggml_new_tensor_3d(pca_ctx.get(), GGML_TYPE_F32, head_dim, head_dim, n_kv_head);
+        d.mean_k = ggml_new_tensor_2d(pca_ctx.get(), GGML_TYPE_F32, head_dim, n_kv_head);
+        d.mean_v = ggml_new_tensor_2d(pca_ctx.get(), GGML_TYPE_F32, head_dim, n_kv_head);
+
+        ggml_format_name(d.W_k,    "pca_W_k_L%u",    r.layer_idx);
+        ggml_format_name(d.W_v,    "pca_W_v_L%u",    r.layer_idx);
+        ggml_format_name(d.W_v_t,  "pca_W_v_t_L%u",  r.layer_idx);
+        ggml_format_name(d.mean_k, "pca_mean_k_L%u", r.layer_idx);
+        ggml_format_name(d.mean_v, "pca_mean_v_L%u", r.layer_idx);
+
+        pca_layers.emplace((int32_t) r.layer_idx, d);
+    }
+
+    // Phase 2: allocate a real CPU backend buffer for all tensors. This sets t->buffer and t->data,
+    // so the graph scheduler knows where to find them (treating them as constants, like model weights).
+    {
+        ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(pca_ctx.get(), buft);
+        if (!buf) {
+            LLAMA_LOG_WARN("%s: failed to allocate PCA backend buffer\n", __func__);
+            pca_layers.clear();
+            pca_ctx.reset();
+            return;
+        }
+        pca_buf.reset(buf);
+    }
+
+    // Phase 3: copy raw data into the allocated tensors, computing W_v_t (per-head transpose) on the fly.
+    const size_t W_bytes    = W_size * sizeof(float);
+    const size_t mean_bytes = mean_size * sizeof(float);
+    std::vector<float> W_v_t_buf(W_size);
+    for (const auto & r : raws) {
+        auto it = pca_layers.find((int32_t) r.layer_idx);
+        GGML_ASSERT(it != pca_layers.end());
+        auto & d = it->second;
+
+        for (uint32_t h = 0; h < n_kv_head; ++h) {
+            const float * src = &r.W_v[(size_t) h * head_dim * head_dim];
+            float       * dst = &W_v_t_buf[(size_t) h * head_dim * head_dim];
+            for (uint32_t i = 0; i < head_dim; ++i) {
+                for (uint32_t j = 0; j < head_dim; ++j) {
+                    dst[j * head_dim + i] = src[i * head_dim + j];
+                }
+            }
+        }
+
+        std::memcpy(d.W_k->data,   r.W_k.data(),         W_bytes);
+        std::memcpy(d.W_v->data,   r.W_v.data(),         W_bytes);
+        std::memcpy(d.W_v_t->data, W_v_t_buf.data(),     W_bytes);
+        std::memcpy(d.mean_k->data, r.mean_k.data(),     mean_bytes);
+        std::memcpy(d.mean_v->data, r.mean_v.data(),     mean_bytes);
+    }
+
+    pca_enabled = !pca_layers.empty();
+    fprintf(stderr, "%s: === PCA rotation ACTIVE: %zu layers, n_kv_head=%u, head_dim=%u ===\n",
+            __func__, pca_layers.size(), n_kv_head, head_dim);
+    fflush(stderr);
+}
+
+const llama_kv_cache::pca_layer_data * llama_kv_cache::pca_get(int32_t il) const {
+    auto it = pca_layers.find(il);
+    return it == pca_layers.end() ? nullptr : &it->second;
+}
+
+bool llama_kv_cache_context::pca_has(int32_t il) const {
+    return kv && kv->pca_has(il);
+}
+
+const llama_kv_cache::pca_layer_data * llama_kv_cache_context::pca_get(int32_t il) const {
+    return kv ? kv->pca_get(il) : nullptr;
+}
+
+bool llama_kv_cache_context::pca_get_mean_only() const {
+    return kv ? kv->pca_get_mean_only() : false;
+}
+
+// ---- KV cache dumper helpers (POC) ----
+
+// Emit a numpy v1.0 .npy header for a little-endian F32 tensor with the given shape.
+// The header dict is padded with spaces so the full preamble (magic + version +
+// header_len + header) is a multiple of 64 bytes, per the format spec.
+static void write_npy_f32_header(std::ofstream & fp, const std::vector<int64_t> & shape) {
+    std::ostringstream sh;
+    sh << "(";
+    for (size_t i = 0; i < shape.size(); ++i) {
+        if (i) sh << ", ";
+        sh << shape[i];
+    }
+    if (shape.size() == 1) sh << ",";
+    sh << ")";
+
+    std::string header = "{'descr': '<f4', 'fortran_order': False, 'shape': " + sh.str() + ", }";
+    // pad with spaces so total (10 prefix + header + '\n') is a multiple of 64
+    size_t total = 10 + header.size() + 1;
+    size_t pad   = (64 - (total % 64)) % 64;
+    header.append(pad, ' ');
+    header.push_back('\n');
+
+    const char magic[6]   = {char(0x93), 'N', 'U', 'M', 'P', 'Y'};
+    const char version[2] = {1, 0};
+    fp.write(magic, 6);
+    fp.write(version, 2);
+    const uint16_t header_len = uint16_t(header.size());
+    fp.write(reinterpret_cast<const char *>(&header_len), sizeof(header_len));
+    fp.write(header.data(), header.size());
+}
+
+// Read the first n_rows of a ggml_tensor (slicing along ne[1]), dequantize each row
+// to F32 via ggml's type traits, and write the result as a .npy payload. The output
+// .npy shape is (n_rows, ne[0]). Caller already opened fp in binary mode and positions
+// it where the .npy should start (header + data).
+static void dequant_tensor_rows_to_npy(const ggml_tensor * t, uint32_t n_rows, std::ofstream & fp) {
+    if (!t || n_rows == 0) return;
+
+    const ggml_type type = t->type;
+    const auto * traits  = ggml_get_type_traits(type);
+    if (!traits || !traits->to_float) {
+        fprintf(stderr, "dequant_tensor_rows_to_npy: no to_float for type %s, skipping\n",
+                ggml_type_name(type));
+        fflush(stderr);
+        return;
+    }
+    const ggml_to_float_t to_float = traits->to_float;
+
+    const int64_t row_elems = t->ne[0];
+    const size_t  row_bytes = t->nb[1] ? size_t(t->nb[1]) : ggml_row_size(type, row_elems);
+    const size_t  total     = row_bytes * size_t(n_rows);
+
+    std::vector<uint8_t> src_buf(total);
+    ggml_backend_tensor_get(t, src_buf.data(), 0, total);
+
+    write_npy_f32_header(fp, { int64_t(n_rows), row_elems });
+
+    std::vector<float> dst_row(row_elems);
+    for (uint32_t r = 0; r < n_rows; ++r) {
+        to_float(src_buf.data() + size_t(r) * row_bytes, dst_row.data(), row_elems);
+        fp.write(reinterpret_cast<const char *>(dst_row.data()), sizeof(float) * size_t(row_elems));
+    }
+}
+
+llama_kv_cache::dump_info llama_kv_cache::dump_to_dir(const std::string & base_dir) const {
+    dump_info info;
+    if (base_dir.empty() || layers.empty()) return info;
+
+    // n_tokens_used: max across all sequences (n_seq_max is typically 1)
+    llama_pos pmax = -1;
+    for (uint32_t s = 0; s < n_seq_max; ++s) {
+        const llama_pos p = seq_pos_max(llama_seq_id(s));
+        if (p > pmax) pmax = p;
+    }
+    info.n_tokens_used = (pmax >= 0) ? uint32_t(pmax + 1) : 0;
+
+    info.kv_capacity = get_size();
+    info.v_trans     = v_trans;
+    info.type_k      = type_k();
+    info.type_v      = type_v();
+    info.pca_enabled = pca_enabled;
+
+    info.head_dim_k = n_embd_head_k_all > 0 ? uint32_t(n_embd_head_k_all) : 0;
+    info.head_dim_v = n_embd_head_v_all > 0 ? uint32_t(n_embd_head_v_all) : 0;
+    if (!layers.empty() && info.head_dim_k > 0 && layers.front().k) {
+        info.n_kv_head = uint32_t(layers.front().k->ne[0]) / info.head_dim_k;
+    }
+
+    for (const auto & [il, _] : pca_layers) info.pca_layer_indices.push_back(il);
+    std::sort(info.pca_layer_indices.begin(), info.pca_layer_indices.end());
+
+    for (const auto & layer : layers) info.kv_layer_indices.push_back(int32_t(layer.il));
+
+    // build subdir name with timestamp
+    std::time_t now_t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    std::tm tm_buf;
+#ifdef _WIN32
+    localtime_s(&tm_buf, &now_t);
+#else
+    localtime_r(&now_t, &tm_buf);
+#endif
+    char ts[32];
+    std::strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", &tm_buf);
+
+    std::ostringstream name;
+    name << "pca_" << (info.pca_enabled ? "true" : "false")
+         << "_ctk_" << ggml_type_name(info.type_k)
+         << "_ctv_" << ggml_type_name(info.type_v)
+         << "_" << ts;
+
+    namespace fs = std::filesystem;
+    fs::path subdir = fs::path(base_dir) / name.str();
+    if (fs::exists(subdir)) {
+        for (int i = 2; i < 1000; ++i) {
+            fs::path cand = fs::path(base_dir) / (name.str() + "_" + std::to_string(i));
+            if (!fs::exists(cand)) { subdir = cand; break; }
+        }
+    }
+
+    std::error_code ec;
+    fs::create_directories(subdir, ec);
+    if (ec) {
+        fprintf(stderr, "%s: failed to create %s: %s\n",
+                __func__, subdir.string().c_str(), ec.message().c_str());
+        fflush(stderr);
+        return info;
+    }
+
+    info.subdir_path = subdir.string();
+
+    fprintf(stderr, "%s: === KV cache dump -> %s (n_tokens_used=%u, %zu layers) ===\n",
+            __func__, subdir.string().c_str(), info.n_tokens_used, layers.size());
+    fflush(stderr);
+
+    if (info.n_tokens_used == 0) {
+        return info;  // meta-only
+    }
+
+    for (const auto & layer : layers) {
+        struct entry { ggml_tensor * t; const char * prefix; };
+        const entry arr[] = { { layer.k, "K" }, { layer.v, "V" } };
+        for (const auto & e : arr) {
+            if (!e.t) continue;
+            std::ostringstream fn;
+            fn << e.prefix << "_layer_" << layer.il << ".npy";
+            fs::path fp = subdir / fn.str();
+            std::ofstream ofs(fp.string(), std::ios::binary);
+            if (!ofs) {
+                fprintf(stderr, "%s: failed to open %s for write\n", __func__, fp.string().c_str());
+                fflush(stderr);
+                continue;
+            }
+            dequant_tensor_rows_to_npy(e.t, info.n_tokens_used, ofs);
+            info.npy_files.push_back(fn.str());
+        }
+    }
+
+    return info;
 }
 
 void llama_kv_cache::clear(bool data) {

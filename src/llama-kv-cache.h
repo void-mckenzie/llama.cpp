@@ -19,6 +19,21 @@ struct llama_context;
 
 class llama_kv_cache : public llama_memory_i {
 public:
+    // PCA KV cache rotation (POC): per-layer, per-KV-head calibrated rotation matrices.
+    // Loaded from a flat .bin produced by pca_dump.py when LLAMA_KV_PCA_FILE is set.
+    //
+    // Cache stores:  K_c = (K - mean_k) * W_k   (per KV head)
+    //                V_c = (V - mean_v) * W_v
+    // Q is rotated as  Q * W_k^T  (no centering; the K-mean shift is absorbed by softmax)
+    // Output back-rotation uses W_v^T and adds mean_v back.
+    struct pca_layer_data {
+        ggml_tensor * W_k   = nullptr;  // F32 [head_dim, head_dim, n_kv_head]
+        ggml_tensor * W_v   = nullptr;  // F32 [head_dim, head_dim, n_kv_head]
+        ggml_tensor * W_v_t = nullptr;  // F32 [head_dim, head_dim, n_kv_head]  (transpose of W_v)
+        ggml_tensor * mean_k = nullptr; // F32 [head_dim, n_kv_head]
+        ggml_tensor * mean_v = nullptr; // F32 [head_dim, n_kv_head]
+    };
+
     struct stream_copy_info {
         bool empty() const {
             assert(ssrc.size() == sdst.size());
@@ -162,6 +177,38 @@ public:
     ggml_type type_v() const;
 
     //
+    // KV cache state dumper (POC)
+    //
+    // Triggered by cli.cpp on /exit when LLAMA_KV_DUMP_DIR is set. Writes per-layer
+    // K_layer_<il>.npy and V_layer_<il>.npy (dequantized F32, row-major) into a
+    // timestamped subdir under base_dir. Returns a dump_info with everything the
+    // caller needs to write meta.json. No-op (returns default-constructed info with
+    // empty subdir_path) if base_dir is empty or the cache has no layers.
+    //
+    // Layout note: K and V are stored as [n_embd_gqa, kv_capacity, n_stream] in
+    // ne[0..2]. We dump the first n_tokens_used rows as (n_tokens_used, n_embd_gqa).
+    // v_trans is recorded but does not change the on-disk layout.
+    struct dump_info {
+        std::string subdir_path;                       // absolute path of subdir written to; "" if skipped
+        bool                  pca_enabled      = false;
+        std::vector<int32_t>  pca_layer_indices;
+        std::vector<int32_t>  kv_layer_indices;        // model layer index per entry in layers
+        uint32_t              n_kv_head        = 0;
+        uint32_t              head_dim_k       = 0;
+        uint32_t              head_dim_v       = 0;
+        uint32_t              n_tokens_used    = 0;     // seq_pos_max(0) + 1
+        uint32_t              kv_capacity      = 0;     // get_size()
+        bool                  v_trans          = false;
+        ggml_type             type_k           = GGML_TYPE_F32;
+        ggml_type             type_v           = GGML_TYPE_F32;
+        std::vector<std::string> npy_files;            // relative filenames written
+    };
+
+    LLAMA_API dump_info dump_to_dir(const std::string & base_dir) const;
+
+    bool get_pca_enabled() const { return pca_enabled; }
+
+    //
     // graph_build API
     //
 
@@ -214,6 +261,17 @@ public:
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
+    // PCA rotation accessors (POC). Returns nullptr if PCA is not enabled for this layer.
+    bool pca_has(int32_t il) const { return pca_enabled && pca_layers.count(il) > 0; }
+    const pca_layer_data * pca_get(int32_t il) const;
+
+    // Mean-only mode (POC, enabled by LLAMA_KV_MEAN_ONLY=1 with LLAMA_KV_PCA_FILE):
+    // load the PCA file but only use the per-head means. Hadamard rotation is NOT
+    // suppressed. build_attn subtracts mean before Hadamard forward and adds mean_v
+    // back after V back-rotation. K mean is dropped (softmax absorbs the per-query
+    // constant). Reproduces ~all of PCA's Q4_0 win without the calibrated W matrices.
+    bool pca_get_mean_only() const { return pca_mean_only; }
+
 private:
     const llama_model & model;
     const llama_hparams & hparams;
@@ -252,6 +310,15 @@ private:
 
     // pre-computed hadamard martrices
     std::unordered_map<int64_t, std::vector<float>> attn_rot_hadamard;
+
+    // PCA rotation storage (POC)
+    bool pca_enabled = false;
+    bool pca_mean_only = false;  // env: LLAMA_KV_MEAN_ONLY
+    std::unordered_map<int32_t, pca_layer_data> pca_layers;
+    ggml_context_ptr        pca_ctx;  // owns the PCA tensor metadata
+    ggml_backend_buffer_ptr pca_buf;  // owns the PCA tensor data (CPU buffer)
+
+    void load_pca(const std::string & path);
 
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
@@ -395,6 +462,11 @@ public:
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
+
+    // PCA rotation accessors (POC) — delegate to llama_kv_cache.
+    bool pca_has(int32_t il) const;
+    const llama_kv_cache::pca_layer_data * pca_get(int32_t il) const;
+    bool pca_get_mean_only() const;
 
 private:
     llama_memory_status status;

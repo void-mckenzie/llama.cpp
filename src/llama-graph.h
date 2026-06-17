@@ -21,6 +21,12 @@ struct llama_layer;
 
 struct llama_memory_context_i;
 
+// Graph-node budget that PCA mean-only mode (LLAMA_KV_PCA_FILE + LLAMA_KV_MEAN_ONLY=1)
+// will add per inference. Computed from the ops emitted by pca_apply_mean_offset in
+// llama-graph.cpp. Used by llama_context::graph_max_nodes to size the compute context
+// pool. Keep in sync with pca_apply_mean_offset.
+uint32_t pca_mean_only_extra_nodes(uint32_t n_kv_head, uint32_t n_layer_attn);
+
 class llama_kv_cache_context;
 class llama_kv_cache_dsa_context;
 class llama_kv_cache_iswa_context;

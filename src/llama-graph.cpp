@@ -81,6 +81,174 @@ static ggml_tensor * ggml_mul_mat_aux(
     return res;
 }
 
+// PCA per-KV-head rotation (POC).
+//
+// cur:  [head_dim, n_head, n_tokens]  (e.g. K, V, or attention output)
+// W:    [head_dim, head_dim, n_kv_head]   (F32, stored as-is from pca_scales.bin)
+//       mul_mat(W_stored_as_is, x) gives FORWARD rotation: W @ x (verified algebraically).
+// mean: [head_dim, n_kv_head]  (F32) or nullptr
+//
+// n_head must be divisible by n_kv_head (GQA). Each KV head h rotates group_size = n_head/n_kv_head
+// contiguous heads of `cur` with the matrix W[:,:,h].
+//
+// If subtract_mean: subtract mean[:, h] from each head in group h BEFORE rotation.
+// If add_mean:      add mean[:, h] AFTER rotation.
+//
+// Returns a tensor with the same shape as cur.
+static ggml_tensor * pca_apply_rotation(
+        ggml_context * ctx,
+        ggml_tensor  * cur,
+        ggml_tensor  * W,
+        ggml_tensor  * mean,
+        bool           subtract_mean,
+        bool           add_mean,
+        int            head_dim,
+        int            n_head,
+        int            n_kv_head,
+        int            n_tokens) {
+    GGML_ASSERT(n_kv_head > 0);
+    GGML_ASSERT(n_head % n_kv_head == 0);
+    const int group_size = n_head / n_kv_head;
+    if (!((int) cur->ne[0] == head_dim) || !((int) cur->ne[1] == n_head) || !((int) cur->ne[2] == n_tokens)) {
+        LLAMA_LOG_ERROR("pca_apply_rotation: shape mismatch. cur->ne = [%lld, %lld, %lld, %lld], "
+                         "expected head_dim=%d n_head=%d n_kv_head=%d n_tokens=%d (sub=%d add=%d)\n",
+                (long long) cur->ne[0], (long long) cur->ne[1], (long long) cur->ne[2], (long long) cur->ne[3],
+                head_dim, n_head, n_kv_head, n_tokens, (int) subtract_mean, (int) add_mean);
+    }
+    GGML_ASSERT((int) cur->ne[0] == head_dim);
+    GGML_ASSERT((int) cur->ne[1] == n_head);
+    GGML_ASSERT((int) cur->ne[2] == n_tokens);
+    GGML_ASSERT((int) W->ne[0] == head_dim && (int) W->ne[1] == head_dim && (int) W->ne[2] == n_kv_head);
+    GGML_ASSERT(!mean || ((int) mean->ne[0] == head_dim && (int) mean->ne[1] == n_kv_head));
+
+    const size_t es = sizeof(float);  // rotation tensors are F32
+
+    ggml_tensor * result = nullptr;
+
+    for (int h = 0; h < n_kv_head; ++h) {
+        // View cur for this KV head's group: [head_dim, group_size, n_tokens]
+        ggml_tensor * cur_h_3d = ggml_view_3d(ctx, cur,
+                /*ne0=*/ head_dim,
+                /*ne1=*/ group_size,
+                /*ne2=*/ n_tokens,
+                /*nb1=*/ head_dim * es,
+                /*nb2=*/ cur->nb[2],
+                /*offset=*/ (size_t) h * group_size * head_dim * es);
+
+        // Make contiguous and reshape to 2D for matmul: [head_dim, group_size*n_tokens]
+        ggml_tensor * cur_h_2d = ggml_reshape_2d(ctx, ggml_cont(ctx, cur_h_3d), head_dim, group_size * n_tokens);
+
+        if (subtract_mean && mean) {
+            ggml_tensor * mean_h   = ggml_view_1d(ctx, mean, head_dim, (size_t) h * head_dim * es);
+            ggml_tensor * mean_h_1 = ggml_reshape_2d(ctx, mean_h, head_dim, 1);
+            ggml_tensor * mean_rep = ggml_repeat(ctx, mean_h_1, cur_h_2d);
+            cur_h_2d = ggml_sub(ctx, cur_h_2d, mean_rep);
+        }
+
+        // View W[:, :, h]: [head_dim, head_dim]
+        ggml_tensor * W_h = ggml_view_2d(ctx, W,
+                /*ne0=*/ head_dim,
+                /*ne1=*/ head_dim,
+                /*nb1=*/ W->nb[1],
+                /*offset=*/ (size_t) h * head_dim * head_dim * es);
+
+        // Forward rotation: out_h_2d = W[h] @ cur_h_2d
+        ggml_tensor * out_h_2d = ggml_mul_mat(ctx, W_h, cur_h_2d);
+
+        if (add_mean && mean) {
+            ggml_tensor * mean_h   = ggml_view_1d(ctx, mean, head_dim, (size_t) h * head_dim * es);
+            ggml_tensor * mean_h_1 = ggml_reshape_2d(ctx, mean_h, head_dim, 1);
+            ggml_tensor * mean_rep = ggml_repeat(ctx, mean_h_1, out_h_2d);
+            out_h_2d = ggml_add(ctx, out_h_2d, mean_rep);
+        }
+
+        // Reshape back to [head_dim, group_size, n_tokens] and concat along head axis
+        ggml_tensor * out_h_3d = ggml_reshape_3d(ctx, out_h_2d, head_dim, group_size, n_tokens);
+        result = result ? ggml_concat(ctx, result, out_h_3d, 1) : out_h_3d;
+    }
+
+    return result;
+}
+
+// Per-KV-head mean offset (POC, mean-only mode).
+//
+// cur:  [head_dim, n_head, n_tokens]   (e.g. K, V, or attention output)
+// mean: [head_dim, n_kv_head]          (F32) — per-KV-head means
+//
+// For each KV head h, broadcasts mean[:, h] across the n_head/n_kv_head Q-heads in that group
+// and all n_tokens, then either subtracts (subtract=true) or adds (subtract=false).
+// No rotation — this is just the centering step. Used in mean-only mode where Hadamard
+// provides the rotation and we only need the per-head mean offset.
+//
+// Math check (K, with subtract=true):
+//   Cache stores  H (K - mean_k)  (Hadamard applied after this offset)
+//   Q is rotated by H too (existing path)
+//   Attn logit H(Q) . H(K - mean_k) = Q . (K - mean_k) = Q.K - Q.mean_k
+//   The Q.mean_k term is per-query constant -> softmax absorbs it. We never need to add it back.
+//
+// For V (subtract=true here, add-back is a separate call after attention+back-rotation):
+//   softmax . H(V - mean_v) back-rotated by H = softmax . (V - mean_v)
+//   Adding mean_v gives softmax.V (since softmax sums to 1).
+
+// Exact graph-node count that pca_apply_mean_offset emits per inference.
+// Per call, per KV head, the loop emits 9 ops:
+//   view_3d, cont, reshape_2d, view_1d, reshape_2d, repeat, sub/add, reshape_3d, concat
+// First iteration skips concat (result is just assigned), so per call = 9*n_kv_head - 1.
+// pca_apply_mean_offset is invoked 3x per attention layer in build_attn:
+//   K subtract, V subtract (forward), V add (after back-rotation).
+uint32_t pca_mean_only_extra_nodes(uint32_t n_kv_head, uint32_t n_layer_attn) {
+    constexpr uint32_t NODES_PER_KV_HEAD_PER_CALL = 9;
+    constexpr uint32_t CALLS_PER_LAYER            = 3;
+    return CALLS_PER_LAYER * (NODES_PER_KV_HEAD_PER_CALL * n_kv_head - 1) * n_layer_attn;
+}
+
+static ggml_tensor * pca_apply_mean_offset(
+        ggml_context * ctx,
+              ggml_tensor  * cur,
+              ggml_tensor  * mean,
+              bool           subtract, // true=sub, false=add
+              int            head_dim,
+              int            n_head,
+              int            n_kv_head,
+              int            n_tokens) {
+    GGML_ASSERT(n_kv_head > 0);
+    GGML_ASSERT(n_head % n_kv_head == 0);
+    const int group_size = n_head / n_kv_head;
+    GGML_ASSERT((int) cur->ne[0] == head_dim);
+    GGML_ASSERT((int) cur->ne[1] == n_head);
+    GGML_ASSERT((int) cur->ne[2] == n_tokens);
+    GGML_ASSERT((int) mean->ne[0] == head_dim && (int) mean->ne[1] == n_kv_head);
+
+    const size_t es = sizeof(float);
+
+    ggml_tensor * result = nullptr;
+
+    for (int h = 0; h < n_kv_head; ++h) {
+        ggml_tensor * cur_h_3d = ggml_view_3d(ctx, cur,
+                /*ne0=*/ head_dim,
+                /*ne1=*/ group_size,
+                /*ne2=*/ n_tokens,
+                /*nb1=*/ head_dim * es,
+                /*nb2=*/ cur->nb[2],
+                /*offset=*/ (size_t) h * group_size * head_dim * es);
+
+        ggml_tensor * cur_h_2d = ggml_reshape_2d(ctx, ggml_cont(ctx, cur_h_3d), head_dim, group_size * n_tokens);
+
+        ggml_tensor * mean_h   = ggml_view_1d(ctx, mean, head_dim, (size_t) h * head_dim * es);
+        ggml_tensor * mean_h_1 = ggml_reshape_2d(ctx, mean_h, head_dim, 1);
+        ggml_tensor * mean_rep = ggml_repeat(ctx, mean_h_1, cur_h_2d);
+
+        ggml_tensor * out_h_2d = subtract
+                ? ggml_sub(ctx, cur_h_2d, mean_rep)
+                : ggml_add(ctx, cur_h_2d, mean_rep);
+
+        ggml_tensor * out_h_3d = ggml_reshape_3d(ctx, out_h_2d, head_dim, group_size, n_tokens);
+        result = result ? ggml_concat(ctx, result, out_h_3d, 1) : out_h_3d;
+    }
+
+    return result;
+}
+
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -2310,13 +2478,44 @@ ggml_tensor * llm_graph_context::build_attn(
             int       il) const {
     GGML_ASSERT(v_mla == nullptr);
 
-    if (inp->self_k_rot) {
-        q_cur = ggml_mul_mat_aux(ctx0, q_cur, inp->self_k_rot);
-        k_cur = ggml_mul_mat_aux(ctx0, k_cur, inp->self_k_rot);
-    }
+    const auto * mctx_cur = inp->mctx;
 
-    if (inp->self_v_rot) {
-        v_cur = ggml_mul_mat_aux(ctx0, v_cur, inp->self_v_rot);
+    // PCA path (POC): if this layer has calibrated PCA rotation, use per-KV-head W/mean tensors.
+    // Math: cache stores  K_c = W_k (K - mean_k),  V_c = W_v (V - mean_v)
+    //       Q is rotated to W_k Q (no centering; mean shift absorbed by softmax)
+    //       After attention, output is back-rotated by W_v^T and mean_v is added back.
+    //
+    // Mean-only mode (LLAMA_KV_MEAN_ONLY=1): pca_get returns the means but pca_get_mean_only is true.
+    // Skip the W rotation; the else branch runs the existing Hadamard path with mean subtracted first.
+    if (const auto * pca = mctx_cur->pca_get(il); pca && !mctx_cur->pca_get_mean_only()) {
+        const int n_tokens_cur = ubatch.n_tokens;
+        const int head_dim     = (int) hparams.n_embd_head_k(il);
+        const int n_head_q     = (int) hparams.n_head();
+        const int n_head_kv    = (int) hparams.n_head_kv(il);
+        // K and V are [head_dim, n_head_kv, n_tokens]; Q is [head_dim, n_head_q, n_tokens]
+        q_cur = pca_apply_rotation(ctx0, q_cur, pca->W_k,   /*mean=*/nullptr,     /*sub=*/false, /*add=*/false, head_dim, n_head_q,  n_head_kv, n_tokens_cur);
+        k_cur = pca_apply_rotation(ctx0, k_cur, pca->W_k,   /*mean=*/pca->mean_k, /*sub=*/true,  /*add=*/false, head_dim, n_head_kv, n_head_kv, n_tokens_cur);
+        v_cur = pca_apply_rotation(ctx0, v_cur, pca->W_v,   /*mean=*/pca->mean_v, /*sub=*/true,  /*add=*/false, head_dim, n_head_kv, n_head_kv, n_tokens_cur);
+    } else {
+        // Mean-only PCA mode (POC): subtract per-head mean_k, mean_v BEFORE Hadamard forward.
+        // K mean is never added back (softmax absorbs the per-query constant).
+        // V mean is added back after attention+back-rotation (see the post-build_attn_mha block).
+        if (const auto * pca = mctx_cur->pca_get(il); pca && mctx_cur->pca_get_mean_only()) {
+            const int n_tokens_cur = ubatch.n_tokens;
+            const int head_dim     = (int) hparams.n_embd_head_k(il);
+            const int n_head_kv    = (int) hparams.n_head_kv(il);
+            k_cur = pca_apply_mean_offset(ctx0, k_cur, pca->mean_k, /*subtract=*/true,  head_dim, n_head_kv, n_head_kv, n_tokens_cur);
+            v_cur = pca_apply_mean_offset(ctx0, v_cur, pca->mean_v, /*subtract=*/true,  head_dim, n_head_kv, n_head_kv, n_tokens_cur);
+        }
+
+        if (inp->self_k_rot) {
+            q_cur = ggml_mul_mat_aux(ctx0, q_cur, inp->self_k_rot);
+            k_cur = ggml_mul_mat_aux(ctx0, k_cur, inp->self_k_rot);
+        }
+
+        if (inp->self_v_rot) {
+            v_cur = ggml_mul_mat_aux(ctx0, v_cur, inp->self_v_rot);
+        }
     }
 
     // these nodes are added to the graph together so that they are not reordered
@@ -2325,8 +2524,6 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_build_forward_expand(gf, q_cur);
     ggml_build_forward_expand(gf, v_cur);
     ggml_build_forward_expand(gf, k_cur);
-
-    const auto * mctx_cur = inp->mctx;
 
     // store to KV cache
     {
@@ -2346,8 +2543,33 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
-    if (inp->self_v_rot) {
-        cur = ggml_mul_mat_aux(ctx0, cur, inp->self_v_rot);
+    if (const auto * pca = mctx_cur->pca_get(il); pca && !mctx_cur->pca_get_mean_only()) {
+        const int n_tokens_cur = ubatch.n_tokens;
+        const int head_dim     = (int) hparams.n_embd_head_k(il);
+        const int n_head_q     = (int) hparams.n_head();
+        const int n_head_kv    = (int) hparams.n_head_kv(il);
+        // Attention output from build_attn_mha is 2D [head_dim*n_head_q, n_tokens].
+        // Reshape to 3D for per-head back-rotation by W_v^T, then add mean_v back.
+        cur = ggml_reshape_3d(ctx0, cur, head_dim, n_head_q, n_tokens_cur);
+        cur = pca_apply_rotation(ctx0, cur, pca->W_v_t, /*mean=*/pca->mean_v, /*sub=*/false, /*add=*/true, head_dim, n_head_q, n_head_kv, n_tokens_cur);
+        cur = ggml_reshape_2d(ctx0, cur, head_dim * n_head_q, n_tokens_cur);
+    } else {
+        if (inp->self_v_rot) {
+            cur = ggml_mul_mat_aux(ctx0, cur, inp->self_v_rot);
+        }
+        // Mean-only PCA mode: add V mean back after Hadamard back-rotation.
+        // The post-back-rotation output is in original V space (centered around 0).
+        // Adding mean_v recovers the original V output. K mean was dropped (softmax absorbed).
+        if (const auto * pca = mctx_cur->pca_get(il); pca && mctx_cur->pca_get_mean_only()) {
+            const int n_tokens_cur = ubatch.n_tokens;
+            const int head_dim     = (int) hparams.n_embd_head_k(il);
+            const int n_head_q     = (int) hparams.n_head();
+            const int n_head_kv    = (int) hparams.n_head_kv(il);
+            // build_attn_mha output is [head_dim*n_head_q, n_tokens]; reshape to 3D for per-head broadcast.
+            cur = ggml_reshape_3d(ctx0, cur, head_dim, n_head_q, n_tokens_cur);
+            cur = pca_apply_mean_offset(ctx0, cur, pca->mean_v, /*subtract=*/false, head_dim, n_head_q, n_head_kv, n_tokens_cur);
+            cur = ggml_reshape_2d(ctx0, cur, head_dim * n_head_q, n_tokens_cur);
+        }
     }
 
     if (wo) {

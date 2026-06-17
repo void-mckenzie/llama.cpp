@@ -9,6 +9,10 @@
 #include "server-context.h"
 #include "server-task.h"
 
+#include "src/llama-memory-hybrid.h"
+#include "src/llama-kv-cache.h"
+#include "build-info.h"
+
 #include <array>
 #include <atomic>
 #include <algorithm>
@@ -671,6 +675,77 @@ int llama_cli(int argc, char ** argv) {
     console::log("\nExiting...\n");
     ctx_cli.ctx_server.terminate();
     inference_thread.join();
+
+    // KV cache dump (POC) — triggered by env var LLAMA_KV_DUMP_DIR
+    if (const char * kv_dump_dir = std::getenv("LLAMA_KV_DUMP_DIR")) {
+        if (kv_dump_dir[0] != '\0') {
+            try {
+                llama_context * ctx = ctx_cli.ctx_server.get_llama_context();
+                llama_memory_t  mem = llama_get_memory(ctx);
+
+                llama_kv_cache * kv = nullptr;
+                if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(mem)) {
+                    kv = hyb->get_mem_attn();
+                } else {
+                    kv = dynamic_cast<llama_kv_cache *>(mem);
+                }
+
+                if (kv) {
+                    auto info = kv->dump_to_dir(kv_dump_dir);
+                    if (!info.subdir_path.empty()) {
+                        namespace fs = std::filesystem;
+                        std::string full_out;
+                        for (const auto & m : ctx_cli.messages) {
+                            if (m.value("role", std::string{}) == "assistant") {
+                                full_out += m.value("content", std::string{});
+                            }
+                        }
+                        json meta;
+                        meta["messages"]         = ctx_cli.messages;
+                        meta["assistant_output"] = full_out;
+                        meta["model_path"]       = params.model.path;
+                        meta["model_name"]       = params.model.name;
+                        meta["sampling"] = json::object({
+                            {"temp",           params.sampling.temp},
+                            {"top_k",          params.sampling.top_k},
+                            {"top_p",          params.sampling.top_p},
+                            {"repeat_penalty", params.sampling.penalty_repeat},
+                        });
+                        meta["n_predict"]    = params.n_predict;
+                        meta["n_keep"]       = params.n_keep;
+                        meta["build_number"] = llama_build_number();
+                        meta["commit"]       = llama_commit();
+                        meta["kv_cache"] = {
+                            {"pca_enabled",       info.pca_enabled},
+                            {"pca_layer_indices", info.pca_layer_indices},
+                            {"kv_layer_indices",  info.kv_layer_indices},
+                            {"n_kv_head",         info.n_kv_head},
+                            {"head_dim_k",        info.head_dim_k},
+                            {"head_dim_v",        info.head_dim_v},
+                            {"n_tokens_used",     info.n_tokens_used},
+                            {"kv_capacity",       info.kv_capacity},
+                            {"v_trans",           info.v_trans},
+                            {"type_k",            ggml_type_name(info.type_k)},
+                            {"type_v",            ggml_type_name(info.type_v)},
+                            {"npy_files",         info.npy_files},
+                            {"layout_note",
+                                "K and V stored row-major as (n_tokens, n_embd_gqa) where "
+                                "n_embd_gqa = n_kv_head * head_dim. Python reshapes to "
+                                "(n_tokens, n_kv_head, head_dim). V is stored in the same "
+                                "layout as K; v_trans only affects attention-time access."},
+                        };
+                        std::ofstream ofs((fs::path(info.subdir_path) / "meta.json").string());
+                        ofs << meta.dump(2);
+                        console::log("KV cache dumped to %s\n", info.subdir_path.c_str());
+                    }
+                } else {
+                    console::log("KV dump skipped: memory is not a llama_kv_cache\n");
+                }
+            } catch (const std::exception & e) {
+                console::log("KV dump failed: %s\n", e.what());
+            }
+        }
+    }
 
     // bump the log level to display timings
     common_log_set_verbosity_thold(LOG_LEVEL_INFO);

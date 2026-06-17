@@ -2324,6 +2324,16 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     for (const auto & lora : model.loras) {
         res += lora->get_n_nodes();
     }
+
+    // PCA mean-only mode (POC) adds graph nodes per attention layer via
+    // pca_apply_mean_offset. Compute the exact count from the helper that lives
+    // next to the emitting function, so the budget stays in sync with the code.
+    if (const char * mo = getenv("LLAMA_KV_MEAN_ONLY"); mo && atoi(mo)) {
+        if (const char * pf = getenv("LLAMA_KV_PCA_FILE"); pf && pf[0]) {
+            const auto & hparams = model.hparams;
+            res += pca_mean_only_extra_nodes(hparams.n_head_kv(), hparams.n_layer());
+        }
+    }
     return res;
 }
 
