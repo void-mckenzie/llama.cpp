@@ -1,0 +1,6 @@
+- [Don't run llama-cli yourself](feedback_no_run_llama_cli.md) — hand the user the command; they run it and paste output
+- [Use Windows paths for native Windows Python/tools](feedback_native_windows_paths.md) — kvpress_env Python needs C:\ paths, not /c/ or /tmp/
+- [llama-cli system prompt flag is -sys](feedback_llama_cli_sys_flag.md) — use -sys, not --sys-prompt
+- [Disable Qwen thinking via --reasoning off](feedback_qwen_disable_thinking.md) — use --reasoning off, not --chat-template-kwargs
+- [KV cache dumper + dashboard exist for PCA POC](project_kv_dumper_dashboard.md) — progress.md has the full state; read before touching PCA
+- [mean-only mode GPU+KL validated](project_mean_only_mode.md) — LLAMA_KV_MEAN_ONLY=1 beats full PCA on Wikitext-2 KL divergence; build-cuda/ for GPU

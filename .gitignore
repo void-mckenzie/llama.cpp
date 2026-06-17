@@ -153,3 +153,18 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# PCA POC overrides — track .bat and .bin inside pca_poc/
+!pca_poc/*.bat
+!pca_poc/data/*.bin
+
+# Local-only dirs (POC outputs, user state)
+/kl_dumps/
+/kv_dumps/
+/kv_dumps_*/
+/.claude/
+__pycache__/
+*.bak
+
+# POC intermediate outputs (calibration chunk dumps)
+/pca_poc/pool_dumps/
